@@ -3,3 +3,4 @@ groq
 google-generativeai
 matplotlib
 pandas
+reportlab
