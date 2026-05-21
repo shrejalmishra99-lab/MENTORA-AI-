@@ -6,8 +6,107 @@ import json
 import re
 import os
 import csv
-from datetime import datetime, date as dt_date
+import sqlite3
+import uuid
+import time
+from datetime import datetime, date as dt_date, timedelta
 from io import BytesIO
+
+# ═══════════════════════════════════════════════════════════════
+# ADMIN CONFIG — change password here
+# ═══════════════════════════════════════════════════════════════
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "mentora123"
+INACTIVE_MINUTES = 10          # mark user offline after this many idle minutes
+
+# ═══════════════════════════════════════════════════════════════
+# USER TRACKING — SQLite database (persists on disk)
+# ═══════════════════════════════════════════════════════════════
+
+DB_PATH = "mentora_users.db"
+
+def _db_init():
+    """Create tables if they don't exist."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id   TEXT PRIMARY KEY,
+            first_seen   TEXT NOT NULL,
+            last_active  TEXT NOT NULL,
+            is_active    INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def _db_upsert_session(session_id: str):
+    """Insert new session or update last_active timestamp. Skip admin sessions."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT session_id FROM sessions WHERE session_id = ?", (session_id,))
+    if c.fetchone():
+        c.execute("UPDATE sessions SET last_active=?, is_active=1 WHERE session_id=?",
+                  (now, session_id))
+    else:
+        c.execute("INSERT INTO sessions VALUES (?,?,?,1)", (session_id, now, now))
+    conn.commit()
+    conn.close()
+
+def _db_mark_inactive():
+    """Mark sessions inactive if last_active > INACTIVE_MINUTES ago."""
+    cutoff = (datetime.now() - timedelta(minutes=INACTIVE_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE sessions SET is_active=0 WHERE last_active < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+
+def _db_get_stats():
+    """Return dict with total, active, today stats."""
+    _db_mark_inactive()
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM sessions")
+    total = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM sessions WHERE is_active=1")
+    active = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM sessions WHERE first_seen LIKE ?", (f"{today}%",))
+    new_today = c.fetchone()[0]
+    # last 7 days per-day counts
+    daily = []
+    for i in range(6, -1, -1):
+        d = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        c.execute("SELECT COUNT(*) FROM sessions WHERE first_seen LIKE ?", (f"{d}%",))
+        daily.append({"date": d, "count": c.fetchone()[0]})
+    conn.close()
+    return {"total": total, "active": active, "new_today": new_today, "daily": daily}
+
+def _db_recent_sessions(limit=20):
+    """Return recent sessions as a list of dicts."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT session_id, first_seen, last_active, is_active
+                 FROM sessions ORDER BY last_active DESC LIMIT ?""", (limit,))
+    rows = [{"id": r[0][:8]+"…", "first_seen": r[1], "last_active": r[2],
+             "status": "🟢 Online" if r[3] else "⚫ Offline"} for r in c.fetchall()]
+    conn.close()
+    return rows
+
+# Initialise DB on startup
+_db_init()
+
+def _track_session():
+    """Call once per page load for non-admin users to record activity."""
+    if st.session_state.get("is_admin"):
+        return   # never track admin visits
+    sid = st.session_state.get("_session_id")
+    if not sid:
+        sid = str(uuid.uuid4())
+        st.session_state["_session_id"] = sid
+    _db_upsert_session(sid)
 
 # PDF generation
 from reportlab.lib.pagesizes import letter, A4
@@ -445,6 +544,8 @@ DEFAULTS = {
     "logged_in": False,
     "login_username": "",
     "app_mode": None,
+    "is_admin": False,           # True when logged in as admin
+    "_session_id": "",           # unique session UUID for tracking
     # ── Coding Practice
     "coding_lang": None,
     "coding_chapter": None,
@@ -1327,9 +1428,91 @@ CODING_CONTENT = {
 }
 
 # ─────────────────────────────────────────────
-# USERS for login
+# USERS for login  (admin handled separately above)
 # ─────────────────────────────────────────────
-USERS = {"admin": "mentora123", "student": "student123", "demo": "demo123"}
+USERS = {"student": "student123", "demo": "demo123"}
+
+# ═══════════════════════════════════════════════════════════════
+# ADMIN DASHBOARD
+# ═══════════════════════════════════════════════════════════════
+
+def show_admin_dashboard():
+    """Full admin-only dashboard — never counted in user stats."""
+
+    # ── Header
+    st.markdown("""
+    <div style="background:linear-gradient(90deg,#1e1b4b,#4c1d95,#7c3aed);
+    border-radius:16px;padding:18px 28px;margin-bottom:24px;
+    box-shadow:0 6px 24px rgba(124,58,237,0.35);">
+    <h2 style="color:#fff;font-family:Poppins,sans-serif;margin:0;font-size:1.5rem;">
+        🛡️ MENTORA AI — Admin Dashboard</h2>
+    <p style="color:#c4b5fd;font-family:Poppins,sans-serif;margin:4px 0 0 0;font-size:0.85rem;">
+        Logged in as <b>admin</b> · Real-time user analytics · You are excluded from stats
+    </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Auto-refresh every 30 s while admin is on dashboard
+    st.markdown(
+        '<meta http-equiv="refresh" content="30">',
+        unsafe_allow_html=True
+    )
+
+    # ── Fetch live stats
+    stats = _db_get_stats()
+
+    # ── KPI metrics row
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("👥 Total Users",    stats["total"],     help="Unique sessions ever recorded")
+    m2.metric("🟢 Active Now",     stats["active"],    help=f"Active within last {INACTIVE_MINUTES} min")
+    m3.metric("🆕 New Today",      stats["new_today"], help="First visit today")
+    m4.metric("⚫ Offline",
+              stats["total"] - stats["active"],
+              help="Sessions inactive > 10 min")
+
+    st.divider()
+
+    # ── Daily chart (last 7 days)
+    st.subheader("📈 New Users — Last 7 Days")
+    daily_df = pd.DataFrame(stats["daily"])
+    if daily_df["count"].sum() > 0:
+        st.bar_chart(daily_df.set_index("date")["count"])
+    else:
+        st.info("No user data yet — share the app to start seeing visits.")
+
+    st.divider()
+
+    # ── Recent sessions table
+    st.subheader("🗂️ Recent Sessions (last 20)")
+    sessions = _db_recent_sessions(20)
+    if sessions:
+        df_sess = pd.DataFrame(sessions)
+        df_sess.columns = ["Session ID", "First Seen", "Last Active", "Status"]
+        st.dataframe(df_sess, use_container_width=True, hide_index=True)
+    else:
+        st.info("No sessions recorded yet.")
+
+    st.divider()
+
+    # ── DB management
+    with st.expander("⚙️ Database Management"):
+        st.caption(f"Database file: `{DB_PATH}`")
+        if st.button("🗑️ Clear All Sessions", key="admin_clear_db"):
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("DELETE FROM sessions")
+            conn.commit()
+            conn.close()
+            st.success("All sessions cleared.")
+            st.rerun()
+
+    # ── Logout
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+    if st.button("🚪 Admin Logout", key="admin_logout"):
+        st.session_state.logged_in      = False
+        st.session_state.is_admin       = False
+        st.session_state.login_username = ""
+        st.session_state.app_mode       = None
+        st.rerun()
 
 def show_login():
 
@@ -1365,9 +1548,19 @@ def show_login():
         if st.button("🚀 Sign In", key="login_btn", use_container_width=True):
             if uname.strip() == "" or pwd.strip() == "":
                 st.warning("⚠️ Please enter both username and password.")
-            elif uname in USERS and USERS[uname] == pwd:
-                st.session_state.logged_in = True
+            elif uname == ADMIN_USERNAME and pwd == ADMIN_PASSWORD:
+                # ── Admin login — set admin flag, do NOT track as user
+                st.session_state.logged_in      = True
                 st.session_state.login_username = uname
+                st.session_state.is_admin       = True
+                st.session_state.app_mode       = "admin"
+                st.success("✅ Welcome, Admin! Redirecting to dashboard…")
+                st.rerun()
+            elif uname in USERS and USERS[uname] == pwd:
+                st.session_state.logged_in      = True
+                st.session_state.login_username = uname
+                st.session_state.is_admin       = False
+                _track_session()   # record this user session
                 st.success(f"✅ Welcome, {uname.title()}!")
                 st.rerun()
             else:
@@ -1376,8 +1569,10 @@ def show_login():
         st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
 
         if st.button("👁️ Quick Demo Login", key="demo_btn", use_container_width=True):
-            st.session_state.logged_in = True
+            st.session_state.logged_in      = True
             st.session_state.login_username = "demo"
+            st.session_state.is_admin       = False
+            _track_session()
             st.rerun()
 
         st.markdown("""
@@ -1577,6 +1772,407 @@ def show_home():
         st.session_state.app_mode = None
         st.rerun()
 
+# ═══════════════════════════════════════════════════════════════
+# YOUTUBE CURATED LINKS — per language, per chapter
+# Each entry: {"query": "search query", "links": [{"title","channel","url"}, ...]}
+# ═══════════════════════════════════════════════════════════════
+YOUTUBE_LINKS = {
+    "C Programming": {
+        "1. Basics & I/O": {
+            "query": "C programming basics printf scanf tutorial",
+            "links": [
+                {"title": "C Programming Full Course",       "channel": "freeCodeCamp",   "url": "https://youtu.be/KJgsSFOSQv0"},
+                {"title": "C Language Tutorial for Beginners","channel": "ProgrammingWithHarry","url": "https://youtu.be/irqbmMNs2Bo"},
+                {"title": "C Programming Basics",            "channel": "Jenny's Lectures","url": "https://youtube.com/results?search_query=jenny+lectures+C+programming+basics"},
+            ]
+        },
+        "2. Operators & Control Flow": {
+            "query": "C programming if else switch loops tutorial",
+            "links": [
+                {"title": "Control Statements in C",  "channel": "Jenny's Lectures","url": "https://youtube.com/results?search_query=jenny+lectures+control+statements+C"},
+                {"title": "Loops in C Programming",   "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+loops+C+programming"},
+            ]
+        },
+        "3. Functions & Recursion": {
+            "query": "C programming functions recursion tutorial",
+            "links": [
+                {"title": "Functions in C",           "channel": "Jenny's Lectures","url": "https://youtube.com/results?search_query=jenny+lectures+functions+C"},
+                {"title": "Recursion in C",           "channel": "Abdul Bari",     "url": "https://youtu.be/kepBmgvWNDw"},
+            ]
+        },
+        "4. Arrays & Strings": {
+            "query": "C programming arrays strings tutorial",
+            "links": [
+                {"title": "Arrays in C",              "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+arrays+C"},
+                {"title": "Strings in C",             "channel": "CodeWithHarry",  "url": "https://youtube.com/results?search_query=codewithharry+strings+C+programming"},
+            ]
+        },
+        "5. Pointers": {
+            "query": "C programming pointers tutorial beginner",
+            "links": [
+                {"title": "Pointers in C — Full Guide","channel": "freeCodeCamp",  "url": "https://youtu.be/zuegQmMdy8M"},
+                {"title": "Pointers & Memory",         "channel": "Jenny's Lectures","url": "https://youtube.com/results?search_query=jenny+lectures+pointers+C+programming"},
+            ]
+        },
+        "6. Structures & Unions": {
+            "query": "C programming structures unions tutorial",
+            "links": [
+                {"title": "Structures in C",          "channel": "Jenny's Lectures","url": "https://youtube.com/results?search_query=jenny+lectures+structures+C"},
+                {"title": "Unions in C",              "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+structures+unions+C"},
+            ]
+        },
+        "7. Dynamic Memory": {
+            "query": "C programming malloc calloc realloc dynamic memory",
+            "links": [
+                {"title": "Dynamic Memory in C",      "channel": "Jenny's Lectures","url": "https://youtube.com/results?search_query=jenny+lectures+dynamic+memory+C"},
+                {"title": "malloc calloc free",       "channel": "CodeWithHarry",  "url": "https://youtube.com/results?search_query=codewithharry+malloc+calloc+C"},
+            ]
+        },
+        "8. File Handling": {
+            "query": "C programming file handling fopen fclose tutorial",
+            "links": [
+                {"title": "File Handling in C",       "channel": "Jenny's Lectures","url": "https://youtube.com/results?search_query=jenny+lectures+file+handling+C"},
+                {"title": "File I/O Complete Guide",  "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+file+handling+C+programming"},
+            ]
+        },
+        "9. Preprocessor & Bitwise": {
+            "query": "C programming preprocessor directives bitwise operators",
+            "links": [
+                {"title": "Preprocessor in C",        "channel": "Jenny's Lectures","url": "https://youtube.com/results?search_query=jenny+lectures+preprocessor+C"},
+                {"title": "Bitwise Operators",        "channel": "CodeWithHarry",  "url": "https://youtube.com/results?search_query=codewithharry+bitwise+operators+C"},
+            ]
+        },
+        "10. Structures & File I/O": {
+            "query": "C programming structures file IO combined tutorial",
+            "links": [
+                {"title": "Structures + File I/O",    "channel": "Jenny's Lectures","url": "https://youtube.com/results?search_query=jenny+lectures+structures+file+IO+C"},
+            ]
+        },
+    },
+    "C++ Programming": {
+        "1. OOP Concepts": {
+            "query": "C++ OOP classes objects encapsulation tutorial",
+            "links": [
+                {"title": "C++ OOP Full Course",      "channel": "freeCodeCamp",   "url": "https://youtu.be/wN0x9eZLix4"},
+                {"title": "Classes & Objects in C++", "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+classes+objects+C++"},
+            ]
+        },
+        "2. Inheritance": {
+            "query": "C++ inheritance types tutorial",
+            "links": [
+                {"title": "Inheritance in C++",       "channel": "Jenny's Lectures","url": "https://youtube.com/results?search_query=jenny+lectures+inheritance+C++"},
+                {"title": "Types of Inheritance",     "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+inheritance+C++"},
+            ]
+        },
+        "3. Polymorphism": {
+            "query": "C++ polymorphism virtual functions override",
+            "links": [
+                {"title": "Polymorphism in C++",      "channel": "Jenny's Lectures","url": "https://youtube.com/results?search_query=jenny+lectures+polymorphism+C++"},
+                {"title": "Virtual Functions",        "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+virtual+functions+C++"},
+            ]
+        },
+        "4. STL Containers": {
+            "query": "C++ STL vector map set tutorial",
+            "links": [
+                {"title": "C++ STL Complete Guide",   "channel": "freeCodeCamp",   "url": "https://youtube.com/results?search_query=freecodecamp+C+++STL+tutorial"},
+                {"title": "STL in C++",               "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+STL+C++"},
+            ]
+        },
+        "5. Templates & Generics": {
+            "query": "C++ templates generic programming tutorial",
+            "links": [
+                {"title": "Templates in C++",         "channel": "Jenny's Lectures","url": "https://youtube.com/results?search_query=jenny+lectures+templates+C++"},
+            ]
+        },
+        "6. Exception Handling": {
+            "query": "C++ exception handling try catch throw",
+            "links": [
+                {"title": "Exception Handling C++",   "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+exception+handling+C++"},
+            ]
+        },
+        "7. File Handling & Streams": {
+            "query": "C++ file handling fstream ifstream ofstream",
+            "links": [
+                {"title": "File Handling in C++",     "channel": "CodeWithHarry",  "url": "https://youtube.com/results?search_query=codewithharry+file+handling+C++"},
+            ]
+        },
+        "8. Smart Pointers & Memory": {
+            "query": "C++ smart pointers unique_ptr shared_ptr tutorial",
+            "links": [
+                {"title": "Smart Pointers in C++",    "channel": "freeCodeCamp",   "url": "https://youtube.com/results?search_query=freecodecamp+smart+pointers+C++"},
+            ]
+        },
+    },
+    "Python": {
+        "1. Basics": {
+            "query": "Python programming basics variables data types tutorial",
+            "links": [
+                {"title": "Python Full Course",       "channel": "freeCodeCamp",   "url": "https://youtu.be/rfscVS0vtbw"},
+                {"title": "Python Tutorial Hindi",    "channel": "CodeWithHarry",  "url": "https://youtu.be/gfDE2a7MKjA"},
+            ]
+        },
+        "2. Lists Tuples Sets Dicts": {
+            "query": "Python lists tuples sets dictionaries tutorial",
+            "links": [
+                {"title": "Python Collections",      "channel": "Corey Schafer",  "url": "https://youtube.com/results?search_query=corey+schafer+python+lists+tuples"},
+                {"title": "Python Data Structures",  "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+python+list+tuple+dict"},
+            ]
+        },
+        "3. Functions & Lambda": {
+            "query": "Python functions lambda map filter tutorial",
+            "links": [
+                {"title": "Python Functions",        "channel": "Corey Schafer",  "url": "https://youtube.com/results?search_query=corey+schafer+python+functions"},
+                {"title": "Lambda Map Filter",       "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+python+lambda+map+filter"},
+            ]
+        },
+        "4. OOP": {
+            "query": "Python OOP classes objects inheritance tutorial",
+            "links": [
+                {"title": "Python OOP Tutorial",     "channel": "Corey Schafer",  "url": "https://youtu.be/ZDa-Z5JzLYM"},
+                {"title": "Python OOP Hindi",        "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+python+OOP"},
+            ]
+        },
+        "6. Modules, Packages & Virtual Env": {
+            "query": "Python modules packages pip virtual environment tutorial",
+            "links": [
+                {"title": "Python Modules",          "channel": "Corey Schafer",  "url": "https://youtube.com/results?search_query=corey+schafer+python+modules+packages"},
+            ]
+        },
+        "7. NumPy & Pandas Basics": {
+            "query": "Python NumPy Pandas tutorial beginners",
+            "links": [
+                {"title": "NumPy Full Tutorial",     "channel": "freeCodeCamp",   "url": "https://youtu.be/QUT1VHiLmmI"},
+                {"title": "Pandas Tutorial",         "channel": "Corey Schafer",  "url": "https://youtu.be/vmEHCJofslg"},
+            ]
+        },
+        "8. Decorators, Generators & Context Managers": {
+            "query": "Python decorators generators yield context managers tutorial",
+            "links": [
+                {"title": "Python Decorators",       "channel": "Corey Schafer",  "url": "https://youtu.be/FsAPt_9Bf3U"},
+                {"title": "Generators in Python",    "channel": "Corey Schafer",  "url": "https://youtu.be/bD05uGo_sVI"},
+            ]
+        },
+    },
+    "Java": {
+        "1. Basics & JVM": {
+            "query": "Java programming basics JVM tutorial beginners",
+            "links": [
+                {"title": "Java Full Course",         "channel": "freeCodeCamp",   "url": "https://youtu.be/grEKMHGYyns"},
+                {"title": "Java Tutorial for Beginners","channel": "Apna College", "url": "https://youtube.com/results?search_query=apna+college+java+tutorial+beginners"},
+            ]
+        },
+        "2. OOP & Inheritance": {
+            "query": "Java OOP inheritance abstract interface tutorial",
+            "links": [
+                {"title": "Java OOP Concepts",        "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+java+OOP"},
+                {"title": "Java Inheritance",         "channel": "Jenny's Lectures","url": "https://youtube.com/results?search_query=jenny+lectures+java+inheritance"},
+            ]
+        },
+        "3. Collections Framework": {
+            "query": "Java collections ArrayList HashMap tutorial",
+            "links": [
+                {"title": "Java Collections",         "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+java+collections+framework"},
+            ]
+        },
+        "4. Exception Handling": {
+            "query": "Java exception handling try catch finally throws tutorial",
+            "links": [
+                {"title": "Java Exception Handling",  "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+java+exception+handling"},
+            ]
+        },
+        "5. Multithreading": {
+            "query": "Java multithreading Thread Runnable synchronized tutorial",
+            "links": [
+                {"title": "Java Multithreading",      "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+java+multithreading"},
+            ]
+        },
+        "6. Java 8 — Streams & Lambda": {
+            "query": "Java 8 streams lambda filter map collect tutorial",
+            "links": [
+                {"title": "Java Streams API",         "channel": "Amigoscode",     "url": "https://youtube.com/results?search_query=amigoscode+java+streams+lambda"},
+            ]
+        },
+        "7. JDBC & File I/O": {
+            "query": "Java JDBC file IO BufferedReader FileWriter tutorial",
+            "links": [
+                {"title": "Java File I/O",            "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+java+file+IO"},
+            ]
+        },
+    },
+    "DSA (Python)": {
+        "1. Arrays & Searching": {
+            "query": "DSA arrays binary search Python tutorial",
+            "links": [
+                {"title": "Binary Search Explained",  "channel": "Abdul Bari",     "url": "https://youtu.be/j5uXyPJ0Pew"},
+                {"title": "Arrays & Searching DSA",   "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+arrays+searching+DSA+python"},
+            ]
+        },
+        "2. Sorting": {
+            "query": "DSA sorting algorithms merge sort quick sort Python",
+            "links": [
+                {"title": "Sorting Algorithms",       "channel": "Abdul Bari",     "url": "https://youtu.be/pkkFqlG0Cf4"},
+                {"title": "Merge Sort Tutorial",      "channel": "freeCodeCamp",   "url": "https://youtube.com/results?search_query=freecodecamp+merge+sort+algorithm"},
+            ]
+        },
+        "3. Linked List": {
+            "query": "DSA linked list singly Python tutorial",
+            "links": [
+                {"title": "Linked List in Python",    "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+linked+list+python"},
+                {"title": "Linked List — Abdul Bari", "channel": "Abdul Bari",     "url": "https://youtube.com/results?search_query=abdul+bari+linked+list"},
+            ]
+        },
+        "4. Stack & Queue": {
+            "query": "DSA stack queue LIFO FIFO Python tutorial",
+            "links": [
+                {"title": "Stack & Queue",            "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+stack+queue+python"},
+                {"title": "Stack using Python",       "channel": "Abdul Bari",     "url": "https://youtube.com/results?search_query=abdul+bari+stack+data+structure"},
+            ]
+        },
+        "5. Trees & Graphs": {
+            "query": "DSA BST trees graphs BFS DFS Python tutorial",
+            "links": [
+                {"title": "Binary Search Tree",       "channel": "Abdul Bari",     "url": "https://youtu.be/9RHO6jU--GU"},
+                {"title": "Graph BFS DFS",            "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+graph+BFS+DFS+python"},
+            ]
+        },
+        "6. Dynamic Programming": {
+            "query": "dynamic programming memoization tabulation Python tutorial",
+            "links": [
+                {"title": "DP — Full Course",         "channel": "freeCodeCamp",   "url": "https://youtu.be/oBt53YbR9Kk"},
+                {"title": "Dynamic Programming",      "channel": "Abdul Bari",     "url": "https://youtube.com/results?search_query=abdul+bari+dynamic+programming"},
+            ]
+        },
+        "7. Heap & Priority Queue": {
+            "query": "DSA heap priority queue min max heap Python",
+            "links": [
+                {"title": "Heaps in Python",          "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+heap+priority+queue+python"},
+            ]
+        },
+    },
+    "SQL": {
+        "1. SQL Basics & DDL": {
+            "query": "SQL basics SELECT DDL CREATE TABLE tutorial",
+            "links": [
+                {"title": "SQL Full Course",          "channel": "freeCodeCamp",   "url": "https://youtu.be/HXV3zeQKqGY"},
+                {"title": "SQL Tutorial Hindi",       "channel": "CodeWithHarry",  "url": "https://youtube.com/results?search_query=codewithharry+SQL+tutorial+hindi"},
+            ]
+        },
+        "2. DML & Filtering": {
+            "query": "SQL INSERT UPDATE DELETE WHERE GROUP BY tutorial",
+            "links": [
+                {"title": "SQL DML Queries",          "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+SQL+DML+queries"},
+            ]
+        },
+        "3. JOINs": {
+            "query": "SQL JOINs INNER LEFT RIGHT FULL tutorial",
+            "links": [
+                {"title": "SQL Joins Explained",      "channel": "freeCodeCamp",   "url": "https://youtube.com/results?search_query=freecodecamp+SQL+joins+tutorial"},
+            ]
+        },
+        "4. Subqueries & Views": {
+            "query": "SQL subqueries views correlated subquery tutorial",
+            "links": [
+                {"title": "SQL Subqueries",           "channel": "Apna College",   "url": "https://youtube.com/results?search_query=apna+college+SQL+subqueries+views"},
+            ]
+        },
+        "5. Transactions & ACID": {
+            "query": "SQL transactions ACID properties COMMIT ROLLBACK tutorial",
+            "links": [
+                {"title": "SQL Transactions",         "channel": "Jenny's Lectures","url": "https://youtube.com/results?search_query=jenny+lectures+SQL+transactions+ACID"},
+            ]
+        },
+    },
+    "JavaScript": {
+        "1. JS Basics": {
+            "query": "JavaScript basics variables let const tutorial",
+            "links": [
+                {"title": "JavaScript Full Course",   "channel": "freeCodeCamp",   "url": "https://youtu.be/PkZNo7MFNFg"},
+                {"title": "JS Tutorial Hindi",        "channel": "CodeWithHarry",  "url": "https://youtube.com/results?search_query=codewithharry+javascript+tutorial+hindi"},
+            ]
+        },
+        "2. Functions & Scope": {
+            "query": "JavaScript functions scope closures arrow functions",
+            "links": [
+                {"title": "JS Functions & Scope",     "channel": "Corey Schafer",  "url": "https://youtube.com/results?search_query=javascript+functions+scope+closures+tutorial"},
+            ]
+        },
+        "3. DOM & Events": {
+            "query": "JavaScript DOM manipulation events tutorial",
+            "links": [
+                {"title": "JS DOM Crash Course",      "channel": "Traversy Media",  "url": "https://youtu.be/0ik6X4DJKCc"},
+            ]
+        },
+        "4. Promises & Async/Await": {
+            "query": "JavaScript promises async await fetch tutorial",
+            "links": [
+                {"title": "Async JavaScript",         "channel": "freeCodeCamp",   "url": "https://youtube.com/results?search_query=freecodecamp+javascript+async+await+promises"},
+            ]
+        },
+        "5. OOP in JavaScript": {
+            "query": "JavaScript OOP classes prototype inheritance tutorial",
+            "links": [
+                {"title": "JS OOP Tutorial",          "channel": "Traversy Media",  "url": "https://youtu.be/PFmuCDHHpwk"},
+            ]
+        },
+        "6. Node.js & Modules": {
+            "query": "Node.js Express modules npm tutorial beginners",
+            "links": [
+                {"title": "Node.js Crash Course",     "channel": "Traversy Media",  "url": "https://youtu.be/fBNz5xF-Kx4"},
+            ]
+        },
+    },
+    "R Programming": {
+        "1. R Basics & Data Types": {
+            "query": "R programming basics data types vectors tutorial",
+            "links": [
+                {"title": "R Programming Full Course","channel": "freeCodeCamp",   "url": "https://youtu.be/_V8eKsto3Ug"},
+            ]
+        },
+        "2. Data Structures in R": {
+            "query": "R programming matrix data frame list factor tutorial",
+            "links": [
+                {"title": "R Data Structures",        "channel": "freeCodeCamp",   "url": "https://youtube.com/results?search_query=R+programming+data+structures+tutorial"},
+            ]
+        },
+        "3. Control Flow & Functions": {
+            "query": "R programming functions loops if else apply tutorial",
+            "links": [
+                {"title": "R Functions & Control",    "channel": "freeCodeCamp",   "url": "https://youtube.com/results?search_query=R+programming+functions+control+flow"},
+            ]
+        },
+        "4. Data Manipulation with dplyr": {
+            "query": "R dplyr tutorial data manipulation pipe operator",
+            "links": [
+                {"title": "dplyr Tutorial",           "channel": "StatQuest",      "url": "https://youtube.com/results?search_query=statquest+dplyr+tutorial+R"},
+            ]
+        },
+        "5. Data Visualisation with ggplot2": {
+            "query": "R ggplot2 data visualisation tutorial",
+            "links": [
+                {"title": "ggplot2 Tutorial",         "channel": "StatQuest",      "url": "https://youtu.be/HPJn1CMvtmI"},
+            ]
+        },
+        "6. Statistics & Data Analysis": {
+            "query": "R statistics t-test regression hypothesis testing tutorial",
+            "links": [
+                {"title": "Statistics with R",        "channel": "StatQuest",      "url": "https://youtube.com/results?search_query=statquest+statistics+R+programming"},
+            ]
+        },
+        "7. File I/O & String Handling": {
+            "query": "R read csv write file string manipulation tutorial",
+            "links": [
+                {"title": "R File I/O",               "channel": "freeCodeCamp",   "url": "https://youtube.com/results?search_query=R+programming+file+IO+string+handling"},
+            ]
+        },
+        "8. R for Machine Learning": {
+            "query": "R machine learning caret classification regression tutorial",
+            "links": [
+                {"title": "ML with R — Full Course",  "channel": "freeCodeCamp",   "url": "https://youtube.com/results?search_query=freecodecamp+machine+learning+R+programming"},
+            ]
+        },
+    },
+}
+
 def show_coding():
     # Nav bar
     ncol1, _, ncol3 = st.columns([1, 4, 1])
@@ -1655,14 +2251,95 @@ def show_coding():
         <h3 style="color:#fff;font-family:Poppins,sans-serif;margin:0;">{info['icon']} {chap}</h3>
         </div>""", unsafe_allow_html=True)
 
-        t1, t2, t3 = st.tabs(["📖 Theory", "💡 Example", "🧠 MCQ Practice"])
+        t1, t2, t3, t4 = st.tabs(["📖 Theory", "💡 Example", "▶️ YouTube", "🧠 MCQ Practice"])
 
         with t1:
+            # ── Key concepts banner
+            st.markdown(f"""
+            <div style="background:linear-gradient(135deg,{info['color']}18,{info['color']}08);
+            border-left:5px solid {info['color']};border-radius:0 12px 12px 0;
+            padding:10px 16px;margin-bottom:14px;">
+            <b style="color:{info['color']};">📌 Chapter:</b>
+            <span style="color:#1e1e2e;"> {chap} &nbsp;|&nbsp; Language: {lang}</span>
+            </div>""", unsafe_allow_html=True)
             st.markdown(content["theory"])
+            # ── Extra tips box
+            st.markdown(f"""
+            <div style="background:#fffbeb;border:1px solid #fcd34d;border-radius:12px;
+            padding:12px 16px;margin-top:16px;">
+            <b style="color:#92400e;">💡 Exam Tips for {chap}:</b><br>
+            <span style="color:#451a03;font-size:0.85rem;">
+            • Understand the concept deeply before memorising syntax.<br>
+            • Practice writing code by hand — common in university exams.<br>
+            • Focus on time &amp; space complexity for algorithm questions.<br>
+            • Try at least 3 variations of each example on your own.
+            </span></div>""", unsafe_allow_html=True)
+
         with t2:
-            st.markdown("### 💡 Code Example")
+            st.markdown(f"### 💡 Code Example — {chap}")
             st.markdown(content["example"])
+            st.info("💡 **Tip:** Copy this code, run it locally, then modify values to see how output changes.")
+
         with t3:
+            # ── YouTube tab with curated links
+            _yt = YOUTUBE_LINKS.get(lang, {}).get(chap, {})
+            yt_q = (_yt.get("query") or f"{lang} {chap} tutorial").replace(" ", "+")
+            yt_search = f"https://www.youtube.com/results?search_query={yt_q}"
+
+            st.markdown(f"""
+            <div style="background:linear-gradient(135deg,#fff1f2,#ffe4e6);
+            border:2px solid #fca5a5;border-radius:18px;
+            padding:24px;text-align:center;margin-bottom:18px;">
+            <div style="font-size:3rem;margin-bottom:8px;">▶️</div>
+            <h3 style="color:#dc2626;font-family:Poppins,sans-serif;margin:0 0 6px 0;">
+                Watch on YouTube</h3>
+            <p style="color:#6b7280;font-size:0.88rem;margin:0 0 18px 0;">
+                Best tutorials for <b style="color:#dc2626;">{chap}</b> in <b style="color:#dc2626;">{lang}</b>
+            </p>
+            <a href="{yt_search}" target="_blank"
+               style="background:linear-gradient(135deg,#dc2626,#b91c1c);
+               color:#fff;text-decoration:none;padding:11px 28px;
+               border-radius:30px;font-weight:700;font-size:0.92rem;
+               box-shadow:0 4px 16px rgba(220,38,38,0.4);display:inline-block;">
+               🔍 Search "{chap}" on YouTube →
+            </a>
+            </div>""", unsafe_allow_html=True)
+
+            # ── Curated direct links for this chapter
+            direct_links = _yt.get("links", [])
+            if direct_links:
+                st.markdown("**🎯 Curated Videos for this Chapter:**")
+                for lnk in direct_links:
+                    st.markdown(
+                        f'<a href="{lnk["url"]}" target="_blank" style="display:flex;align-items:center;'
+                        f'background:#fff;border:1.5px solid #fca5a5;border-radius:12px;'
+                        f'padding:10px 16px;margin:6px 0;text-decoration:none;color:#1e1e2e;">'
+                        f'<span style="font-size:1.4rem;margin-right:12px;">▶️</span>'
+                        f'<span><b style="color:#dc2626;">{lnk["title"]}</b>'
+                        f'<br><small style="color:#6b7280;">{lnk["channel"]}</small></span></a>',
+                        unsafe_allow_html=True)
+
+            # ── Suggested search terms
+            st.markdown("<br>**📌 More Search Ideas:**", unsafe_allow_html=True)
+            suggestions = [
+                f"{lang} {chap} for beginners",
+                f"{lang} {chap} with examples",
+                f"{lang} {chap} interview questions",
+                f"{lang} {chap} university exam",
+            ]
+            cols_yt = st.columns(2)
+            for idx_s, s in enumerate(suggestions):
+                sq = s.replace(" ", "+")
+                su = f"https://www.youtube.com/results?search_query={sq}"
+                cols_yt[idx_s % 2].markdown(
+                    f'<a href="{su}" target="_blank" style="display:block;'
+                    f'background:#fff5f5;border:1px solid #fca5a5;border-radius:10px;'
+                    f'padding:7px 14px;margin:4px 0;color:#dc2626;font-size:0.82rem;text-decoration:none;">'
+                    f'▶ {s}</a>',
+                    unsafe_allow_html=True)
+            st.caption("🏆 Recommended channels: **freeCodeCamp · CodeWithHarry · Apna College · Jenny's Lectures · Abdul Bari**")
+
+        with t4:
             st.markdown("### 🧠 AI MCQ Practice")
             st.caption(f"Topic: {content['mcq_topic']}")
             if not st.session_state.code_mcqs:
@@ -2916,7 +3593,7 @@ def show_pyq():
                     if st.button(f"🤖 Generate Solution", key=f"pyq_sol_btn_{qi}"):
                         with st.spinner("Generating solution..."):
                             try:
-                                sol_messages = [{"role": "system", "content": "You are an expert engineering professor."}, {"role": "user", "content": f"Provide a detailed solution for this exam question:\n\n{q}"}]
+                                sol_messages = [{"role": "system", "content": "You are an expert engineering professor."}, {"role": "user", "content": f"Provide a detailed solution for this exam question:\n\n{q_text}"}]
                                 res2_raw = safe_chat(sol_messages, temperature=0.3, max_tokens=500)
                                 if res2_raw is None: raise Exception("AI service unavailable. Check API key.")
                                 class _R: pass
@@ -3157,38 +3834,37 @@ def show_reminders():
         st.rerun()
 
 
-# ── ROUTING
+# ═══════════════════════════════════════════════════════════════
+# MAIN ROUTING
+# ═══════════════════════════════════════════════════════════════
 if not st.session_state.logged_in:
-    show_login(); st.stop()
-if st.session_state.app_mode is None:
-    show_home(); st.stop()
-if st.session_state.app_mode == "coding":
-    show_coding(); st.stop()
-if st.session_state.app_mode == "schedule":
-    show_schedule(); st.stop()
-if st.session_state.app_mode == "subtest":
-    show_subtest(); st.stop()
-if st.session_state.app_mode == "gate":
-    show_gate(); st.stop()
-# ── Group 2: Career & Performance
-if st.session_state.app_mode == "interview":
-    show_interview(); st.stop()
-if st.session_state.app_mode == "notes":
-    show_notes(); st.stop()
-if st.session_state.app_mode == "cgpa":
-    show_cgpa(); st.stop()
-if st.session_state.app_mode == "leaderboard":
-    show_leaderboard(); st.stop()
-# ── Group 3: Exam Specific
-if st.session_state.app_mode == "countdown":
-    show_countdown(); st.stop()
-if st.session_state.app_mode == "pyq":
-    show_pyq(); st.stop()
-if st.session_state.app_mode == "syllabus":
-    show_syllabus(); st.stop()
-if st.session_state.app_mode == "reminders":
-    show_reminders(); st.stop()
-# else → tracker falls through to sidebar below
+    show_login()
+    st.stop()
+
+if st.session_state.is_admin:
+    show_admin_dashboard()
+    st.stop()
+
+# ── Non-admin logged-in user: track session heartbeat
+_track_session()
+
+# ── Route to sub-pages (all except tracker)
+_mode = st.session_state.app_mode
+if _mode == "coding":      show_coding();      st.stop()
+if _mode == "schedule":    show_schedule();    st.stop()
+if _mode == "subtest":     show_subtest();     st.stop()
+if _mode == "gate":        show_gate();        st.stop()
+if _mode == "interview":   show_interview();   st.stop()
+if _mode == "notes":       show_notes();       st.stop()
+if _mode == "cgpa":        show_cgpa();        st.stop()
+if _mode == "leaderboard": show_leaderboard(); st.stop()
+if _mode == "countdown":   show_countdown();   st.stop()
+if _mode == "pyq":         show_pyq();         st.stop()
+if _mode == "syllabus":    show_syllabus();    st.stop()
+if _mode == "reminders":   show_reminders();   st.stop()
+if _mode is None:          show_home();        st.stop()
+
+# ── Tracker (has sidebar — falls through below)
 
 # ─────────────────────────────────────────────
 # 7. SIDEBAR
